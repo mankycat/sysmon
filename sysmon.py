@@ -114,7 +114,6 @@ def poll_gpus_nvml():
         count = pynvml.nvmlDeviceGetCount()
         for i in range(count):
             h = pynvml.nvmlDeviceGetHandleByIndex(i)
-            # 名稱可能是 bytes
             try:
                 name = pynvml.nvmlDeviceGetName(h)
                 name = name.decode("utf-8") if isinstance(name, (bytes, bytearray)) else str(name)
@@ -148,7 +147,7 @@ def poll_gpus_nvml():
                 "power_w": power_w,
                 "temp_c": float(temp_c) if temp_c is not None else None,
             })
-    except Exception as e:
+    except Exception:
         if os.environ.get("SYSMON_DEBUG") == "1":
             import traceback; traceback.print_exc()
         return []
@@ -172,7 +171,6 @@ def poll_gpus_smi():
     for row in reader:
         if not row:
             continue
-        # 順序：idx,name,util,power,temp,mem_used(MiB),mem_total(MiB)
         try:
             idx, name, util, power, temp, mem_used, mem_total = [c.strip() for c in row]
             res.append({
@@ -284,7 +282,7 @@ def collect_loop(db_path, interval, debug=False, gpu_via="nvml"):
         conn.close()
         nvml_shutdown()
 
-# ----------- Plotting -----------
+# ----------- Plot helpers -----------
 def parse_time(s):
     # Accept "YYYY-mm-dd HH:MM" or epoch seconds
     s = s.strip()
@@ -336,7 +334,37 @@ def safe_nan(arr):
     import math
     return [(x if x is not None else math.nan) for x in arr]
 
-def plot_range(db_path, t_from, t_to, outdir):
+def bin_series(ts, vals, bin_sec):
+    """將時間序列以 bin_sec 做平均分箱；返回 (binned_ts, binned_vals)。"""
+    if not ts or bin_sec is None or bin_sec <= 0:
+        return ts, vals
+    out_t, out_v = [], []
+    acc_v, acc_n = 0.0, 0
+    cur_bin_start = ts[0] - (ts[0] % bin_sec)
+    cur_bin_end = cur_bin_start + bin_sec
+    import math
+    for t, v in zip(ts, vals):
+        vv = None
+        if v is not None and not (isinstance(v, float) and math.isnan(v)):
+            try:
+                vv = float(v)
+            except Exception:
+                vv = None
+        while t >= cur_bin_end:
+            out_t.append(cur_bin_end)
+            out_v.append((acc_v/acc_n) if acc_n > 0 else math.nan)
+            cur_bin_start = cur_bin_end
+            cur_bin_end = cur_bin_start + bin_sec
+            acc_v, acc_n = 0.0, 0
+        if vv is not None and not math.isnan(vv):
+            acc_v += vv
+            acc_n += 1
+    out_t.append(cur_bin_end)
+    out_v.append((acc_v/acc_n) if acc_n > 0 else math.nan)
+    return out_t, out_v
+
+# ----------- Plotting -----------
+def plot_range(db_path, t_from, t_to, outdir, bin_seconds=0):
     ensure_dir(outdir)
     conn = sqlite3.connect(db_path)
 
@@ -352,19 +380,26 @@ def plot_range(db_path, t_from, t_to, outdir):
         ctemp = [r[3] for r in rows]
         rapl = [r[4] for r in rows]
 
-        plot_series(ts, [cpu], ["CPU %"], "CPU Utilization", "percent",
+        tt, vv = ts, cpu
+        tt, vv = bin_series(tt, vv, bin_seconds)
+        plot_series(tt, [vv], ["CPU %"], "CPU Utilization", "percent",
                     os.path.join(outdir, "host_cpu_percent.png"))
-        plot_series(ts, [mem], ["Memory %"], "Memory Utilization", "percent",
+
+        tt, vv = ts, mem
+        tt, vv = bin_series(tt, vv, bin_seconds)
+        plot_series(tt, [vv], ["Memory %"], "Memory Utilization", "percent",
                     os.path.join(outdir, "host_mem_percent.png"))
 
         if any(v is not None for v in ctemp):
-            plot_series(ts, [[v if v is not None else math.nan for v in ctemp]],
-                        ["CPU temp"], "CPU Temperature", "°C",
+            vv = [v if v is not None else math.nan for v in ctemp]
+            tt, vv = bin_series(ts, vv, bin_seconds)
+            plot_series(tt, [vv], ["CPU temp"], "CPU Temperature", "°C",
                         os.path.join(outdir, "host_cpu_temp.png"))
 
         if any(v is not None for v in rapl):
-            plot_series(ts, [[v if v is not None else math.nan for v in rapl]],
-                        ["CPU pkg (RAPL)"], "CPU Package Power (RAPL)", "Watts",
+            vv = [v if v is not None else math.nan for v in rapl]
+            tt, vv = bin_series(ts, vv, bin_seconds)
+            plot_series(tt, [vv], ["CPU pkg (RAPL)"], "CPU Package Power (RAPL)", "Watts",
                         os.path.join(outdir, "host_cpu_rapl_watts.png"))
 
     # GPU charts (per GPU index)
@@ -389,19 +424,25 @@ def plot_range(db_path, t_from, t_to, outdir):
         s = lambda arr: [v if v is not None else math.nan for v in arr]
         base = f"gpu{gpu_index}_{str(name).replace(' ','_').replace('/','-')}"
 
-        plot_series(ts, [util], [f"GPU{gpu_index} util%"],
+        tt, vv = bin_series(ts, s(util), bin_seconds)
+        plot_series(tt, [vv], [f"GPU{gpu_index} util%"],
                     f"{name} - Utilization", "percent",
                     os.path.join(outdir, f"{base}_util.png"))
-        plot_series(ts, [mem_used],
-                    [f"GPU{gpu_index} mem used (/{mem_total:.2f} GB)" if isinstance(mem_total,(int,float)) else f"GPU{gpu_index} mem used"],
+
+        tt, vv = bin_series(ts, s(mem_used), bin_seconds)
+        label = f"GPU{gpu_index} mem used (/{mem_total:.2f} GB)" if isinstance(mem_total,(int,float)) else f"GPU{gpu_index} mem used"
+        plot_series(tt, [vv], [label],
                     f"{name} - VRAM Used", "GB",
                     os.path.join(outdir, f"{base}_mem_used.png"))
+
         if any(v is not None for v in power):
-            plot_series(ts, [s(power)], [f"GPU{gpu_index} power W"],
+            tt, vv = bin_series(ts, s(power), bin_seconds)
+            plot_series(tt, [vv], [f"GPU{gpu_index} power W"],
                         f"{name} - Power", "Watts",
                         os.path.join(outdir, f"{base}_power.png"))
         if any(v is not None for v in temp):
-            plot_series(ts, [s(temp)], [f"GPU{gpu_index} temp °C"],
+            tt, vv = bin_series(ts, s(temp), bin_seconds)
+            plot_series(tt, [vv], [f"GPU{gpu_index} temp °C"],
                         f"{name} - Temperature", "°C",
                         os.path.join(outdir, f"{base}_temp.png"))
 
@@ -436,14 +477,21 @@ def plot_range(db_path, t_from, t_to, outdir):
             dt = max(1e-6, t1 - t0)
             util.append(max(0.0, min(100.0, (b1 - b0) / dt / 10.0)))  # 1000ms=100%
 
+        # 對速率/利用率再做分箱
+        ts_r, rMBps = bin_series(ts1, rMBps, bin_seconds)
+        _,    wMBps = bin_series(ts1, wMBps, bin_seconds)
+        ts_i, rIOPS = bin_series(ts1, rIOPS, bin_seconds)
+        _,    wIOPS = bin_series(ts1, wIOPS, bin_seconds)
+        ts_u, util  = bin_series(ts1, util,  bin_seconds)
+
         base = f"disk_{device.replace('/','-')}"
-        plot_series(ts1, [rMBps, wMBps], ["read MB/s","write MB/s"],
+        plot_series(ts_r, [rMBps, wMBps], ["read MB/s","write MB/s"],
                     f"{device} - Throughput", "MB/s",
                     os.path.join(outdir, f"{base}_mbps.png"))
-        plot_series(ts1, [rIOPS, wIOPS], ["read IOPS","write IOPS"],
+        plot_series(ts_i, [rIOPS, wIOPS], ["read IOPS","write IOPS"],
                     f"{device} - IOPS", "ops/s",
                     os.path.join(outdir, f"{base}_iops.png"))
-        plot_series(ts1, [util], ["util %"],
+        plot_series(ts_u, [util], ["util %"],
                     f"{device} - Utilization (approx.)", "percent",
                     os.path.join(outdir, f"{base}_util.png"))
 
@@ -469,6 +517,8 @@ def main():
     ap_p.add_argument("--to", dest="time_to", required=True,
                       help='e.g. "2025-09-10 12:00" (local) or epoch seconds')
     ap_p.add_argument("--out", dest="outdir", default="charts")
+    ap_p.add_argument("--bin-seconds", type=int, default=0,
+                      help="繪圖端分箱秒數（0=不分箱，建議 30/60/300 等）")
 
     args = ap.parse_args()
 
@@ -479,7 +529,7 @@ def main():
         t_to = parse_time(args.time_to)
         if t_to <= t_from:
             raise SystemExit("--to must be greater than --from")
-        plot_range(args.db, t_from, t_to, args.outdir)
+        plot_range(args.db, t_from, t_to, args.outdir, args.bin_seconds)
 
 if __name__ == "__main__":
     main()
