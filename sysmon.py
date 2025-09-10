@@ -1,5 +1,5 @@
 # sysmon.py
-import argparse, sqlite3, time, os, math
+import argparse, sqlite3, time, os, math, subprocess, csv
 from datetime import datetime, timezone
 import psutil
 import matplotlib.pyplot as plt
@@ -72,8 +72,8 @@ class RaplMeter:
         self.last_energy = None
         self.last_time = None
     def read_watts(self):
-        # 返回「自上次呼叫到現在」的平均瓦數；第一次呼叫回傳 None
-        if not self.path: return None
+        if not self.path:
+            return None
         try:
             now = time.time()
             with open(self.path, "r") as f:
@@ -84,14 +84,14 @@ class RaplMeter:
             duj = uj - self.last_energy
             dt = max(1e-6, now - self.last_time)
             self.last_energy, self.last_time = uj, now
-            # 微焦耳 -> 焦耳，再除以秒 = 瓦
-            return (duj / 1_000_000.0) / dt
+            return (duj / 1_000_000.0) / dt  # μJ→J，再/秒=瓦
         except Exception:
             return None
 
-# ----------- GPU (NVML) -----------
+# ----------- GPU (NVML / nvidia-smi) -----------
 def nvml_init():
-    if not _NVML_OK: return False
+    if not _NVML_OK:
+        return False
     try:
         pynvml.nvmlInit()
         return True
@@ -100,23 +100,37 @@ def nvml_init():
 
 def nvml_shutdown():
     if _NVML_OK:
-        try: pynvml.nvmlShutdown()
-        except Exception: pass
+        try:
+            pynvml.nvmlShutdown()
+        except Exception:
+            pass
 
-def poll_gpus():
-    """Return list of dict per GPU"""
+def poll_gpus_nvml():
+    """Return list of dict per GPU via NVML"""
     out = []
-    if not _NVML_OK: return out
+    if not _NVML_OK:
+        return out
     try:
         count = pynvml.nvmlDeviceGetCount()
         for i in range(count):
             h = pynvml.nvmlDeviceGetHandleByIndex(i)
-            name = pynvml.nvmlDeviceGetName(h).decode("utf-8", errors="ignore")
-            util = pynvml.nvmlDeviceGetUtilizationRates(h).gpu
-            mem = pynvml.nvmlDeviceGetMemoryInfo(h)
-            mem_used_gb = mem.used / (1024**3)
-            mem_total_gb = mem.total / (1024**3)
-            # power may raise on unsupported devices
+            # 名稱可能是 bytes
+            try:
+                name = pynvml.nvmlDeviceGetName(h)
+                name = name.decode("utf-8") if isinstance(name, (bytes, bytearray)) else str(name)
+            except Exception:
+                name = f"GPU-{i}"
+            try:
+                util = pynvml.nvmlDeviceGetUtilizationRates(h).gpu
+            except Exception:
+                util = None
+            try:
+                mem = pynvml.nvmlDeviceGetMemoryInfo(h)
+                mem_used_gb = mem.used / (1024**3)
+                mem_total_gb = mem.total / (1024**3)
+            except Exception:
+                mem_used_gb = None
+                mem_total_gb = None
             try:
                 power_w = pynvml.nvmlDeviceGetPowerUsage(h) / 1000.0
             except Exception:
@@ -129,37 +143,72 @@ def poll_gpus():
                 "gpu_index": i,
                 "name": name,
                 "util": float(util) if util is not None else None,
-                "mem_used_gb": mem_used_gb,
-                "mem_total_gb": mem_total_gb,
+                "mem_used_gb": float(mem_used_gb) if mem_used_gb is not None else None,
+                "mem_total_gb": float(mem_total_gb) if mem_total_gb is not None else None,
                 "power_w": power_w,
                 "temp_c": float(temp_c) if temp_c is not None else None,
             })
-    except Exception:
-        pass
+    except Exception as e:
+        if os.environ.get("SYSMON_DEBUG") == "1":
+            import traceback; traceback.print_exc()
+        return []
     return out
+
+def poll_gpus_smi():
+    """
+    使用 nvidia-smi 查詢：index,name,util,power,temp,mem_used,mem_total
+    回傳與 NVML 版相同結構
+    """
+    q = "index,name,utilization.gpu,power.draw,temperature.gpu,memory.used,memory.total"
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", f"--query-gpu={q}", "--format=csv,noheader,nounits"],
+            stderr=subprocess.STDOUT, timeout=3
+        ).decode()
+    except Exception:
+        return []
+    res = []
+    reader = csv.reader(out.strip().splitlines())
+    for row in reader:
+        if not row:
+            continue
+        # 順序：idx,name,util,power,temp,mem_used(MiB),mem_total(MiB)
+        try:
+            idx, name, util, power, temp, mem_used, mem_total = [c.strip() for c in row]
+            res.append({
+                "gpu_index": int(idx),
+                "name": name,
+                "util": float(util) if util not in ("N/A", "") else None,
+                "mem_used_gb": (float(mem_used) / 1024.0) if mem_used not in ("N/A","") else None,
+                "mem_total_gb": (float(mem_total) / 1024.0) if mem_total not in ("N/A","") else None,
+                "power_w": float(power) if power not in ("N/A","") else None,
+                "temp_c": float(temp) if temp not in ("N/A","") else None,
+            })
+        except Exception:
+            continue
+    return res
 
 # ----------- Host sensors -----------
 def host_temps_c():
     """Pick a representative CPU temp (max of cores) if available."""
     try:
         temps = psutil.sensors_temperatures()
-        if not temps: return None
+        if not temps:
+            return None
         candidates = []
         for label, entries in temps.items():
             for e in entries:
                 if e.current is not None:
-                    # prefer CPU/coretemp packages
                     score = 2 if ("core" in label.lower() or "cpu" in label.lower()) else 1
                     candidates.append((score, e.current))
-        if not candidates: return None
-        # max of highest-score group
+        if not candidates:
+            return None
         max_score = max(s for s,_ in candidates)
-        vals = [v for s,v in candidates if s==max_score]
+        vals = [v for s,v in candidates if s == max_score]
         return max(vals) if vals else None
     except Exception:
         return None
 
-import itertools
 def poll_disks():
     # per-disk counters + total
     try:
@@ -167,7 +216,6 @@ def poll_disks():
         total = psutil.disk_io_counters(perdisk=False, nowrap=True)
     except Exception:
         return {}, None
-    # busy_time 欄位不同平台可能無，容錯為 0
     def busy_ms(x): return getattr(x, "busy_time", 0)
     per_out = {
         dev: dict(read_bytes=v.read_bytes, write_bytes=v.write_bytes,
@@ -180,16 +228,23 @@ def poll_disks():
                    busy_ms=busy_ms(total))
     return per_out, tot_out
 
-
 # ----------- Collector loop -----------
-def collect_loop(db_path, interval):
+def collect_loop(db_path, interval, debug=False, gpu_via="nvml"):
     conn = init_db(db_path)
     rapl = RaplMeter()
-    have_nvml = nvml_init()
-    print(f"[collector] writing to {db_path} every {interval}s; NVML={have_nvml}, RAPL={'on' if rapl.path else 'off'}")
+    have_nvml = (gpu_via == "nvml") and nvml_init()
+    print(f"[collector] writing to {db_path} every {interval}s; NVML={have_nvml}, RAPL={'on' if rapl.path else 'off'}, gpu_via={gpu_via}")
+    if debug and have_nvml:
+        try:
+            drv = pynvml.nvmlSystemGetDriverVersion()
+            drv = drv.decode() if isinstance(drv, (bytes, bytearray)) else str(drv)
+            print("[nvml] driver:", drv)
+            print("[nvml] cuda:", getattr(pynvml, "nvmlSystemGetCudaDriverVersion_v2", lambda: "N/A")())
+            print("[nvml] count:", pynvml.nvmlDeviceGetCount())
+        except Exception as e:
+            print("[nvml] sanity error:", repr(e))
     try:
-        # prime cpu_percent first call
-        psutil.cpu_percent(interval=None)
+        psutil.cpu_percent(interval=None)  # prime
         while True:
             ts = utc_now_epoch()
             cpu_p = psutil.cpu_percent(interval=None)
@@ -203,25 +258,25 @@ def collect_loop(db_path, interval):
                     "INSERT INTO host_metrics(ts,cpu_percent,mem_percent,cpu_temp_c,rapl_watts) VALUES(?,?,?,?,?)",
                     (ts, cpu_p, mem_p, cpu_tc, rapl_w)
                 )
-                for g in poll_gpus():
+                # GPU metrics
+                gpu_list = poll_gpus_nvml() if have_nvml else poll_gpus_smi()
+                for g in gpu_list:
                     conn.execute(
                         "INSERT INTO gpu_metrics(ts,gpu_index,name,util_percent,mem_used_gb,mem_total_gb,power_w,temp_c) VALUES(?,?,?,?,?,?,?,?)",
                         (ts, g["gpu_index"], g["name"], g["util"], g["mem_used_gb"], g["mem_total_gb"], g["power_w"], g["temp_c"])
                     )
-        
-                # per device
+                # Disk metrics (per device)
                 for dev, v in per.items():
                     conn.execute(
-                    "INSERT INTO disk_metrics(ts,device,read_bytes,write_bytes,read_count,write_count,busy_ms) VALUES(?,?,?,?,?,?,?)",
-                    (ts, dev, v["read_bytes"], v["write_bytes"], v["read_count"], v["write_count"], v["busy_ms"])
+                        "INSERT INTO disk_metrics(ts,device,read_bytes,write_bytes,read_count,write_count,busy_ms) VALUES(?,?,?,?,?,?,?)",
+                        (ts, dev, v["read_bytes"], v["write_bytes"], v["read_count"], v["write_count"], v["busy_ms"])
                     )
-                # total row
+                # Disk total
                 if tot:
                     conn.execute(
-                    "INSERT INTO disk_metrics(ts,device,read_bytes,write_bytes,read_count,write_count,busy_ms) VALUES(?,?,?,?,?,?,?)",
-                    (ts, "__total__", tot["read_bytes"], tot["write_bytes"], tot["read_count"], tot["write_count"], tot["busy_ms"])
+                        "INSERT INTO disk_metrics(ts,device,read_bytes,write_bytes,read_count,write_count,busy_ms) VALUES(?,?,?,?,?,?,?)",
+                        (ts, "__total__", tot["read_bytes"], tot["write_bytes"], tot["read_count"], tot["write_count"], tot["busy_ms"])
                     )
-
             time.sleep(interval)
     except KeyboardInterrupt:
         print("\n[collector] stopped by user.")
@@ -233,7 +288,8 @@ def collect_loop(db_path, interval):
 def parse_time(s):
     # Accept "YYYY-mm-dd HH:MM" or epoch seconds
     s = s.strip()
-    if s.isdigit(): return float(s)
+    if s.isdigit():
+        return float(s)
     dt = datetime.strptime(s, "%Y-%m-%d %H:%M")
     return dt.replace(tzinfo=timezone.utc).timestamp()
 
@@ -251,13 +307,13 @@ def ts_to_local_str(ts):
 
 def plot_series(x, ys, labels, title, ylab, out_png):
     plt.figure(figsize=(10,4.5))
-    for y,lab in zip(ys, labels):
+    for y, lab in zip(ys, labels):
         plt.plot(x, y, label=lab, linewidth=1.5)
     plt.title(title)
     plt.xlabel("time")
     plt.ylabel(ylab)
-    if len(labels)>1: plt.legend(loc="best")
-    # x ticks thinning
+    if len(labels) > 1:
+        plt.legend(loc="best")
     if len(x) > 12:
         step = max(1, len(x)//12)
         xt = x[::step]; xtl = [ts_to_local_str(t) for t in xt]
@@ -269,9 +325,8 @@ def plot_series(x, ys, labels, title, ylab, out_png):
     plt.close()
 
 def deriv_per_sec(ts, vals):
-    # 以相鄰差分 / Δt，回傳與 ts[1:] 對齊的序列
     out_ts, out_v = [], []
-    for (t0,v0),(t1,v1) in zip(zip(ts,vals), zip(ts[1:], vals[1:])):
+    for (t0, v0), (t1, v1) in zip(zip(ts, vals), zip(ts[1:], vals[1:])):
         dt = max(1e-6, t1 - t0)
         out_ts.append(t1)
         out_v.append((v1 - v0) / dt)
@@ -279,7 +334,7 @@ def deriv_per_sec(ts, vals):
 
 def safe_nan(arr):
     import math
-    return [ (x if x is not None else math.nan) for x in arr ]
+    return [(x if x is not None else math.nan) for x in arr]
 
 def plot_range(db_path, t_from, t_to, outdir):
     ensure_dir(outdir)
@@ -297,14 +352,20 @@ def plot_range(db_path, t_from, t_to, outdir):
         ctemp = [r[3] for r in rows]
         rapl = [r[4] for r in rows]
 
-        plot_series(ts, [cpu], ["CPU %"], "CPU Utilization", "percent", os.path.join(outdir, "host_cpu_percent.png"))
-        plot_series(ts, [mem], ["Memory %"], "Memory Utilization", "percent", os.path.join(outdir, "host_mem_percent.png"))
+        plot_series(ts, [cpu], ["CPU %"], "CPU Utilization", "percent",
+                    os.path.join(outdir, "host_cpu_percent.png"))
+        plot_series(ts, [mem], ["Memory %"], "Memory Utilization", "percent",
+                    os.path.join(outdir, "host_mem_percent.png"))
 
         if any(v is not None for v in ctemp):
-            plot_series(ts, [[v if v is not None else math.nan for v in ctemp]], ["CPU temp"], "CPU Temperature", "°C", os.path.join(outdir, "host_cpu_temp.png"))
+            plot_series(ts, [[v if v is not None else math.nan for v in ctemp]],
+                        ["CPU temp"], "CPU Temperature", "°C",
+                        os.path.join(outdir, "host_cpu_temp.png"))
 
         if any(v is not None for v in rapl):
-            plot_series(ts, [[v if v is not None else math.nan for v in rapl]], ["CPU pkg (RAPL)"], "CPU Package Power (RAPL)", "Watts", os.path.join(outdir, "host_cpu_rapl_watts.png"))
+            plot_series(ts, [[v if v is not None else math.nan for v in rapl]],
+                        ["CPU pkg (RAPL)"], "CPU Package Power (RAPL)", "Watts",
+                        os.path.join(outdir, "host_cpu_rapl_watts.png"))
 
     # GPU charts (per GPU index)
     cols, gpus = query_df(conn,
@@ -316,7 +377,8 @@ def plot_range(db_path, t_from, t_to, outdir):
             "SELECT ts,util_percent,mem_used_gb,mem_total_gb,power_w,temp_c FROM gpu_metrics WHERE ts BETWEEN ? AND ? AND gpu_index=? ORDER BY ts",
             (t_from, t_to, gpu_index)
         )
-        if not rows: continue
+        if not rows:
+            continue
         ts = [r[0] for r in rows]
         util = [r[1] for r in rows]
         mem_used = [r[2] for r in rows]
@@ -324,20 +386,30 @@ def plot_range(db_path, t_from, t_to, outdir):
         power = [r[4] for r in rows]
         temp = [r[5] for r in rows]
 
-        safe = lambda arr: [v if v is not None else math.nan for v in arr]
-        base = f"gpu{gpu_index}_{name.replace(' ','_').replace('/','-')}"
+        s = lambda arr: [v if v is not None else math.nan for v in arr]
+        base = f"gpu{gpu_index}_{str(name).replace(' ','_').replace('/','-')}"
 
-        plot_series(ts, [util], [f"GPU{gpu_index} util%"], f"{name} - Utilization", "percent", os.path.join(outdir, f"{base}_util.png"))
-        plot_series(ts, [mem_used], [f"GPU{gpu_index} mem used (/{mem_total:.2f} GB)" if mem_total else f"GPU{gpu_index} mem used"], f"{name} - VRAM Used", "GB", os.path.join(outdir, f"{base}_mem_used.png"))
+        plot_series(ts, [util], [f"GPU{gpu_index} util%"],
+                    f"{name} - Utilization", "percent",
+                    os.path.join(outdir, f"{base}_util.png"))
+        plot_series(ts, [mem_used],
+                    [f"GPU{gpu_index} mem used (/{mem_total:.2f} GB)" if isinstance(mem_total,(int,float)) else f"GPU{gpu_index} mem used"],
+                    f"{name} - VRAM Used", "GB",
+                    os.path.join(outdir, f"{base}_mem_used.png"))
         if any(v is not None for v in power):
-            plot_series(ts, [safe(power)], [f"GPU{gpu_index} power W"], f"{name} - Power", "Watts", os.path.join(outdir, f"{base}_power.png"))
+            plot_series(ts, [s(power)], [f"GPU{gpu_index} power W"],
+                        f"{name} - Power", "Watts",
+                        os.path.join(outdir, f"{base}_power.png"))
         if any(v is not None for v in temp):
-            plot_series(ts, [safe(temp)], [f"GPU{gpu_index} temp °C"], f"{name} - Temperature", "°C", os.path.join(outdir, f"{base}_temp.png"))
+            plot_series(ts, [s(temp)], [f"GPU{gpu_index} temp °C"],
+                        f"{name} - Temperature", "°C",
+                        os.path.join(outdir, f"{base}_temp.png"))
 
+    # Disk charts (per device + total)
     cols, devs = query_df(conn,
-    "SELECT DISTINCT device FROM disk_metrics WHERE ts BETWEEN ? AND ? ORDER BY device",
-    (t_from, t_to))
-
+        "SELECT DISTINCT device FROM disk_metrics WHERE ts BETWEEN ? AND ? ORDER BY device",
+        (t_from, t_to)
+    )
     for (device,) in devs:
         cols, rows = query_df(conn, """
             SELECT ts, read_bytes, write_bytes, read_count, write_count, busy_ms
@@ -354,25 +426,26 @@ def plot_range(db_path, t_from, t_to, outdir):
         wC  = [r[4] for r in rows]
         bms = [r[5] for r in rows]
 
-        # 轉速率
         ts1, rMBps = deriv_per_sec(ts, rB);  rMBps = [x/1_000_000 for x in rMBps]
         _,   wMBps = deriv_per_sec(ts, wB);  wMBps = [x/1_000_000 for x in wMBps]
         _,   rIOPS = deriv_per_sec(ts, rC)
         _,   wIOPS = deriv_per_sec(ts, wC)
 
-        # 利用率(%) ≈ Δbusy_ms / Δt
         util = []
         for (t0,b0),(t1,b1) in zip(zip(ts, bms), zip(ts[1:], bms[1:])):
             dt = max(1e-6, t1 - t0)
-            util.append( max(0.0, min(100.0, (b1 - b0) / dt / 10.0)) )  # 1000ms=100%, *1/10
+            util.append(max(0.0, min(100.0, (b1 - b0) / dt / 10.0)))  # 1000ms=100%
 
         base = f"disk_{device.replace('/','-')}"
         plot_series(ts1, [rMBps, wMBps], ["read MB/s","write MB/s"],
-                    f"{device} - Throughput", "MB/s", os.path.join(outdir, f"{base}_mbps.png"))
+                    f"{device} - Throughput", "MB/s",
+                    os.path.join(outdir, f"{base}_mbps.png"))
         plot_series(ts1, [rIOPS, wIOPS], ["read IOPS","write IOPS"],
-                    f"{device} - IOPS", "ops/s", os.path.join(outdir, f"{base}_iops.png"))
+                    f"{device} - IOPS", "ops/s",
+                    os.path.join(outdir, f"{base}_iops.png"))
         plot_series(ts1, [util], ["util %"],
-                    f"{device} - Utilization (approx.)", "percent", os.path.join(outdir, f"{base}_util.png"))
+                    f"{device} - Utilization (approx.)", "percent",
+                    os.path.join(outdir, f"{base}_util.png"))
 
     conn.close()
     print(f"[plot] charts saved to: {outdir}")
@@ -385,19 +458,23 @@ def main():
     ap_c = sub.add_parser("collect", help="run collector loop")
     ap_c.add_argument("--db", default="metrics.db")
     ap_c.add_argument("--interval", type=int, default=2, help="sampling seconds")
+    ap_c.add_argument("--debug", action="store_true")
+    ap_c.add_argument("--gpu-via", choices=["nvml","smi"], default="nvml",
+                      help="GPU metrics via NVML (default) or nvidia-smi fallback")
 
     ap_p = sub.add_parser("plot", help="plot charts for a time range")
     ap_p.add_argument("--db", default="metrics.db")
-    ap_p.add_argument("--from", dest="time_from", required=True, help='e.g. "2025-09-08 10:00" (local) or epoch seconds')
-    ap_p.add_argument("--to", dest="time_to", required=True, help='e.g. "2025-09-08 12:00" (local) or epoch seconds')
+    ap_p.add_argument("--from", dest="time_from", required=True,
+                      help='e.g. "2025-09-10 10:00" (local) or epoch seconds')
+    ap_p.add_argument("--to", dest="time_to", required=True,
+                      help='e.g. "2025-09-10 12:00" (local) or epoch seconds')
     ap_p.add_argument("--out", dest="outdir", default="charts")
 
     args = ap.parse_args()
 
     if args.cmd == "collect":
-        collect_loop(args.db, args.interval)
+        collect_loop(args.db, args.interval, args.debug, args.gpu_via)
     else:
-        # plot
         t_from = parse_time(args.time_from)
         t_to = parse_time(args.time_to)
         if t_to <= t_from:
