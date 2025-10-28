@@ -38,3 +38,52 @@ python sysmon_dash.py --db metrics.db --port 8050 --host 0.0.0.0
 # (可改 --port 與 --host)
 ```
 
+
+
+# linux system service for sysmon.py
+```
+sudo nano /etc/systemd/system/sysmon.service
+```
+
+```
+[Unit]
+Description=SysMon Collector (CPU/GPU/Disk -> SQLite)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=<# put working path here>
+Environment=SYSMON_DEBUG=0
+ExecStart=<python venv>/bin/python <python file path>/sysmon.py collect \
+  --db /data/bruce/metrics.db --interval 2 --gpu-via smi
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+```
+
+# linux system service for dashboard
+```
+sudo nano /etc/systemd/system/sysmon-dash.service
+```
+
+```
+[Unit]
+Description=SysMon Plotly Dashboard
+After=network.target sysmon.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=<# put working path here>
+ExecStart=<python venv path>/bin/python <python path>/sysmon_dash.py \
+  --db <output db path>/metrics.db --host 0.0.0.0 --port <listen port>
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
