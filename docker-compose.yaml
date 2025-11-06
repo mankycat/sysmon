@@ -1,0 +1,28 @@
+services:
+  monitor:
+    build:
+      context: .
+      dockerfile: ./Dockerfile
+    image: ubiflow-harbor-staging.ubitus.ai/ai/system.monitor:0.0.2
+    container_name: system.monitor
+    restart: always
+    ipc: host  # Allow container to share host's IPC namespace
+    runtime: nvidia  # Specifying the Nvidia runtime
+    shm_size: "8g"  # Set shared memory size to 8GB
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      NIM_LOG_LEVEL: "DEBUG"
+      CUDA_LAUNCH_BLOCKING: 1
+    env_file:
+      - config.env
+    ports:
+      - "${PORT}:${PORT}"
+    volumes: 
+      - ./data/metrics.db:/app/metrics.db
+    

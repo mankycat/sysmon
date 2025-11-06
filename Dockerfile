@@ -1,6 +1,11 @@
-FROM python:3.14-alpine
+FROM nvcr.io/nvidia/cuda:12.8.1-cudnn-devel-rockylinux9
 
-RUN pip install --no-cache-dir psutil pynvml matplotlib dash plotly pandas
+RUN dnf install -y python3 && \
+    dnf install -y python3-pip && \
+    dnf install -y mesa-libGL && \
+    ln -sf /usr/bin/python3 /usr/local/bin/python && \
+    ln -sf /usr/bin/pip3 /usr/local/bin/pip
+RUN pip install --no-cache-dir psutil nvidia-ml-py matplotlib dash plotly pandas
 
 WORKDIR /app
 COPY sysmon.py .
