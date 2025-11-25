@@ -37,7 +37,7 @@ ssh -p "${SSH_PORT}" \
     -L "${LOCAL_PORT}:localhost:${REMOTE_PORT}" \
     -o ServerAliveInterval=30 \
     -o ServerAliveCountMax=3 \
-    "${REMOTE_USER}@${REMOTE_HOST}" &
+    "${REMOTE_USER}@${REMOTE_HOST}" 
 
 PID=$!
 echo "$PID" > "$PID_FILE"

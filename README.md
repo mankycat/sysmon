@@ -87,3 +87,21 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target
 ```
+
+
+# shell script
+
+Add Permission
+```
+chmod +x start_sysmon_tunnel.sh stop_sysmon_tunnel.sh
+```
+
+Start tunnel
+```
+./start_sysmon_tunnel.sh
+```
+
+Stop tunnel
+```
+./stop_sysmon_tunnel.sh
+```
