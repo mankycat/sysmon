@@ -1,7 +1,7 @@
 # Dependencies
 
 ```
-pip install psutil pynvml matplotlib
+pip install psutil matplotlib nvidia-ml-py
 ```
 
 # How to use - sysmon.py
