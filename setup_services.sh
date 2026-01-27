@@ -68,7 +68,7 @@ Type=simple
 User=root
 WorkingDirectory=$SCRIPT_DIR
 Environment=SYSMON_DEBUG=0
-ExecStart=$VENV_DIR/bin/python $SCRIPT_DIR/sysmon.py collect --db $DB_PATH --interval 2 --gpu-via smi
+ExecStart=$VENV_DIR/bin/python $SCRIPT_DIR/sysmon.py collect --db $DB_PATH --interval 2 
 Restart=always
 RestartSec=3
 
