@@ -28,8 +28,10 @@ def bin_series(ts, vals, bin_sec):
     if bin_sec is None or bin_sec <= 0 or len(ts) == 0:
         return ts, vals
     s = pd.Series(vals, index=pd.to_datetime(ts, unit="s", utc=True)).astype("float64")
-    rs = s.resample(f"{int(bin_sec)}S").mean()
-    new_ts = (rs.index.view("int64") // 10**9).tolist()
+    rs = s.resample(f"{int(bin_sec)}s").mean()
+    # pandas 3 can use microsecond resolution instead of nanoseconds.
+    # Convert explicitly to epoch seconds without assuming the index unit.
+    new_ts = [int(t.timestamp()) for t in rs.index]
     new_vals = rs.values.tolist()
     return new_ts, new_vals
 
@@ -37,7 +39,8 @@ def deriv_per_sec(ts, vals):
     """把累積量轉成速率；回傳 (ts1, rate) 與 ts[1:] 對齊"""
     if len(ts) < 2:
         return [], []
-    dt = pd.Series(ts).diff().fillna(0).values
+    # pandas 3 Copy-on-Write can expose a read-only array via .values.
+    dt = pd.Series(ts).diff().fillna(0).to_numpy(copy=True)
     dv = pd.Series(vals).diff().fillna(0).values
     dt[dt == 0] = 1e-6
     rate = (dv / dt)[1:]

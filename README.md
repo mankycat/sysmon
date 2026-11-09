@@ -38,6 +38,23 @@ python sysmon_dash.py --db metrics.db --port 8050 --host 0.0.0.0
 # (可改 --port 與 --host)
 ```
 
+## 回看離線資料與 pandas 相容性
+
+在 macOS / Linux 回看伺服器 UTC 時間的資料時，可將 dashboard 固定以 UTC 啟動：
+
+```sh
+TZ=UTC python sysmon_dash.py --db /absolute/path/to/metrics.db --host 127.0.0.1 --port 8050
+```
+
+From / To 請填 UTC 的 `YYYY-mm-dd HH:MM`。`Bin seconds` 可用 `60` 或 `300` 做平均分箱，`0` 則顯示原始資料。分箱已使用新版 pandas 支援的小寫秒單位 `s`，並以不依賴 DatetimeIndex 儲存精度的方式轉回 epoch seconds，避免 pandas 3 出現 `Invalid frequency: 60S` 或錯誤的 1970 年時間軸。
+磁碟速率計算也會先複製需修改的陣列，以相容 pandas 3 的 Copy-on-Write 行為，避免 `assignment destination is read-only`。
+
+安裝 dashboard 相依套件後，在專案根目錄執行回歸測試（不會啟動 dashboard 或修改資料庫）：
+
+```sh
+python -m unittest discover -s tests -v
+```
+
 
 
 # linux system service for sysmon.py
