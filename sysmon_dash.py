@@ -1,6 +1,7 @@
 # sysmon_dash.py
 import argparse, sqlite3, math
 from datetime import datetime, timezone, timedelta
+from sysmon_run import open_readonly, resolve_inputs, resolve_window, parse_timestamp
 
 import pandas as pd
 from dash import Dash, dcc, html, Input, Output, State, no_update
@@ -8,7 +9,7 @@ import plotly.graph_objs as go
 
 # ---------- DB helpers ----------
 def open_conn(db_path):
-    return sqlite3.connect(db_path, check_same_thread=False)
+    return open_readonly(db_path)
 
 def qdf(conn, sql, args=()):
     df = pd.read_sql_query(sql, conn, params=args)
@@ -50,7 +51,7 @@ def safe_float_list(a):
     return [ (float(x) if x is not None and not (isinstance(x, float) and math.isnan(x)) else None) for x in a ]
 
 def ts_to_local_str(ts):
-    return datetime.fromtimestamp(ts).strftime("%m-%d %H:%M:%S")
+    return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 # ---------- Data loaders ----------
 def load_host(conn, t_from, t_to):
@@ -202,7 +203,7 @@ def make_gpu_figs(df_gpu, bin_sec, selected_gpu_indices=None):
     return figs
 
 # ---------- Dash App ----------
-def make_app(db_path):
+def make_app(db_path, *, time_window=None, auto_refresh=False, refresh_seconds=30, bin_seconds=60):
     conn0 = open_conn(db_path)
     tmin, tmax = get_ts_minmax(conn0)
     conn0.close()
@@ -212,35 +213,38 @@ def make_app(db_path):
     if tmax is None:
         tmax = now_epoch
         tmin = tmax - 2*3600
-    default_from = datetime.fromtimestamp(tmax - 2*3600).strftime("%Y-%m-%d %H:%M")
-    default_to   = datetime.fromtimestamp(tmax).strftime("%Y-%m-%d %H:%M")
+    first = time_window["start_epoch"] if time_window else tmax - 2*3600
+    last = time_window["end_epoch"] if time_window else tmax
+    default_from = datetime.fromtimestamp(math.floor(first / 60) * 60, timezone.utc).strftime("%Y-%m-%d %H:%M")
+    default_to = datetime.fromtimestamp(math.ceil(last / 60) * 60, timezone.utc).strftime("%Y-%m-%d %H:%M")
 
     app = Dash(__name__)
     app.title = "sysmon dashboard"
 
     app.layout = html.Div([
         html.H2("System Monitoring Dashboard (Plotly/Dash)"),
+        html.P("All chart and filter times are UTC. Display buffer is for context, not training statistics."),
         html.Div([
             html.Label("DB path"),
             dcc.Input(id="db-path", type="text", value=db_path, style={"width":"320px","marginRight":"8px"}),
 
-            html.Label("From"),
+            html.Label("From (UTC)"),
             dcc.Input(id="from-time", type="text", value=default_from, placeholder="YYYY-mm-dd HH:MM",
                       style={"width":"170px","marginRight":"8px"}),
 
-            html.Label("To"),
+            html.Label("To (UTC)"),
             dcc.Input(id="to-time", type="text", value=default_to, placeholder="YYYY-mm-dd HH:MM",
                       style={"width":"170px","marginRight":"8px"}),
 
             html.Label("Bin seconds"),
-            dcc.Input(id="bin-sec", type="number", value=60, min=0, step=10, style={"width":"120px","marginRight":"8px"}),
+            dcc.Input(id="bin-sec", type="number", value=bin_seconds, min=0, step=10, style={"width":"120px","marginRight":"8px"}),
 
             html.Button("Refresh", id="refresh-btn", n_clicks=0, style={"marginRight":"12px"}),
 
             # Auto refresh controls
-            dcc.Checklist(id="auto-on", options=[{"label":" Auto refresh","value":"on"}], value=["on"],
+            dcc.Checklist(id="auto-on", options=[{"label":" Auto refresh","value":"on"}], value=["on"] if auto_refresh else [],
                           style={"marginRight":"8px"}),
-            dcc.Input(id="auto-sec", type="number", value=30, min=5, step=5,
+            dcc.Input(id="auto-sec", type="number", value=refresh_seconds, min=5, step=5,
                       style={"width":"100px","marginRight":"8px"}),
             html.Span("sec", style={"marginRight":"12px"}),
 
@@ -251,7 +255,7 @@ def make_app(db_path):
         ], style={"display":"flex","flexWrap":"wrap","gap":"10px","alignItems":"center","marginBottom":"10px"}),
 
         # Interval timer
-        dcc.Interval(id="auto-intv", interval=30_000, n_intervals=0, disabled=False),
+        dcc.Interval(id="auto-intv", interval=refresh_seconds * 1000, n_intervals=0, disabled=not auto_refresh),
 
         html.Hr(),
 
@@ -314,7 +318,7 @@ def make_app(db_path):
     def refresh(_, __, gpu_selected, db_path_in, t_from_str, t_to_str, bin_sec):
         # parse times
         def parse_dt(s):
-            return datetime.strptime(s.strip(), "%Y-%m-%d %H:%M").replace(tzinfo=None).timestamp()
+            return parse_timestamp(s)
         try:
             t_from = parse_dt(t_from_str)
             t_to = parse_dt(t_to_str)
@@ -382,13 +386,34 @@ def make_app(db_path):
     return app
 
 # ---------- CLI ----------
-if __name__ == "__main__":
+def main(argv=None):
     parser = argparse.ArgumentParser(description="Interactive dashboard for sysmon (Plotly/Dash)")
-    parser.add_argument("--db", dest="db", required=True, help="SQLite DB from sysmon.py collector")
+    parser.add_argument("--db", help="SQLite DB; defaults to RUN_DIR/metrics/sysmon/metrics.db")
+    parser.add_argument("--run-dir", help="Run directory containing metadata/start-time.txt and end-time.txt")
+    parser.add_argument("--from", dest="start", help="Override start, ISO 8601 or epoch; naive times mean UTC")
+    parser.add_argument("--to", dest="end", help="Override end; must accompany --from")
+    parser.add_argument("--buffer-minutes", type=float, default=60, help="Display padding on each side (default: 60)")
+    parser.add_argument("--bin-seconds", type=int, default=60)
+    parser.add_argument("--auto-refresh", action="store_true", help="Opt in to periodic refresh; default is disabled")
+    parser.add_argument("--refresh-seconds", type=int, default=30)
     parser.add_argument("--port", type=int, default=8050)
     parser.add_argument("--host", type=str, default="127.0.0.1")
-    args = parser.parse_args()
-
-    db_path = args.db
-    app = make_app(db_path)
+    args = parser.parse_args(argv)
+    try:
+        run_dir, db_path = resolve_inputs(args.run_dir, args.db)
+        time_window = resolve_window(run_dir, args.start, args.end, args.buffer_minutes)
+        if args.bin_seconds < 0 or args.refresh_seconds < 5:
+            raise ValueError("--bin-seconds must be >= 0 and --refresh-seconds must be >= 5")
+    except (ValueError, OSError, OverflowError) as exc:
+        parser.error(str(exc))
+    if time_window:
+        print(f"Display UTC: {time_window['start_utc']} to {time_window['end_utc']}")
+    else:
+        print("No run metadata or explicit window: showing the last two DB hours (UTC).")
+    app = make_app(str(db_path), time_window=time_window, auto_refresh=args.auto_refresh,
+                   refresh_seconds=args.refresh_seconds, bin_seconds=args.bin_seconds)
     app.run(debug=False, host=args.host, port=args.port)
+
+
+if __name__ == "__main__":
+    main()

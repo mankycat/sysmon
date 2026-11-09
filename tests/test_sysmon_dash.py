@@ -1,11 +1,15 @@
 import math
 import unittest
+import sqlite3
+import tempfile
+from pathlib import Path
 from datetime import datetime, timezone
 from unittest.mock import patch
 
 import pandas as pd
 
-from sysmon_dash import bin_series, deriv_per_sec
+from sysmon_dash import bin_series, deriv_per_sec, make_app, ts_to_local_str
+from sysmon_run import resolve_window
 
 
 class BinSeriesTests(unittest.TestCase):
@@ -65,6 +69,32 @@ class DerivPerSecondTests(unittest.TestCase):
     def test_insufficient_samples(self):
         self.assertEqual(deriv_per_sec([], []), ([], []))
         self.assertEqual(deriv_per_sec([1.0], [10.0]), ([], []))
+
+
+class DashboardDefaultsTests(unittest.TestCase):
+    def test_metadata_window_and_disabled_refresh_are_in_layout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = Path(directory) / "metrics.db"
+            with sqlite3.connect(db) as conn:
+                conn.execute("CREATE TABLE host_metrics(ts REAL)")
+            window = resolve_window(start="2026-11-06T13:18:39Z", end="2026-11-08T13:58:13Z", buffer_minutes=60)
+            app = make_app(str(db), time_window=window)
+            components = {}
+            def walk(component):
+                if getattr(component, "id", None):
+                    components[component.id] = component
+                children = getattr(component, "children", None)
+                for child in children if isinstance(children, (list, tuple)) else [children]:
+                    if child is not None and not isinstance(child, (str, int, float)):
+                        walk(child)
+            walk(app.layout)
+            self.assertEqual(components["from-time"].value, "2026-11-06 12:18")
+            self.assertEqual(components["to-time"].value, "2026-11-08 14:59")
+            self.assertEqual(components["auto-on"].value, [])
+            self.assertTrue(components["auto-intv"].disabled)
+
+    def test_axis_time_explicitly_uses_utc(self):
+        self.assertEqual(ts_to_local_str(0), "1970-01-01 00:00:00")
 
 
 if __name__ == "__main__":

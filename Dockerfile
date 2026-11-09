@@ -8,8 +8,7 @@ RUN dnf install -y python3 && \
 RUN pip install --no-cache-dir psutil nvidia-ml-py matplotlib dash plotly pandas
 
 WORKDIR /app
-COPY sysmon.py .
-COPY sysmon_dash.py .
+COPY sysmon.py sysmon_dash.py sysmon_run.py sysmon_stats.py ./
 COPY start.sh .
 
 RUN chmod +x start.sh
